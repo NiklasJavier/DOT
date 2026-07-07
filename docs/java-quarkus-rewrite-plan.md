@@ -1,282 +1,394 @@
-# SOT — Rewrite-Plan: Bash → natives Java-CLI (Quarkus + GraalVM)
+# SOT — Rewrite-Plan: Bash → natives Java-CLI (Quarkus + GraalVM), als dynamischer App-Manager
 
-> **Richtungsentscheidung:** SOT wird **komplett** von Bash auf ein **natives Java-CLI** umgebaut — **Java 21 + Quarkus 3.37+ + Picocli + GraalVM/Mandrel native-image**, als ein einzelnes selbstständiges Binary pro Plattform. Kein In-place-Bash-Refactoring mehr (der alte [`refactoring-plan.md`](./refactoring-plan.md) ist damit obsolet).
+> **Was gebaut wird:** SOT wird komplett von Bash auf ein **natives Java-CLI** umgebaut — **Java 21 · Quarkus 3.37+ · Picocli · GraalVM/Mandrel native-image**, ein selbstständiges Binary pro Plattform, **gebaut mit Gradle**, mit einem **Justfile** als Entwickler-Frontend.
 >
-> **Grundlage:** Die bestehende Fähigkeits-/Befund-Inventur ([`refactoring-findings.md`](./refactoring-findings.md), 88 Befunde) ist die **funktionale Spezifikation** — jede heute vorhandene Fähigkeit muss im Java-CLI erhalten bleiben, und jeder der 88 Bugs muss im Neubau entweder **strukturell verschwinden** oder **bewusst gehärtet** werden. Der Ziel-Entwurf wurde von 9 Architektur-Agenten je Schicht entworfen; Quarkus/Picocli-Fakten sind gegen die aktuelle Doku (Context7) geprüft.
+> **Wozu:** SOT ist ein **dynamischer App-Manager für die eigene Umgebung** — ein CLI-**App-Selektor**, mit dem der Owner seine **eigenen Anwendungen** installiert, aktualisiert und **überwacht** (welche App ist veraltet), plattform-/quellenübergreifend, **ohne den Toolneubau** (neue App = neue Manifest-Datei im Katalog).
+>
+> **Grundlagen-Doku (Evidenz):** [`refactoring-findings.md`](./refactoring-findings.md) (88 Ist-Befunde = funktionale Spec), [`java-quarkus-design-brief.md`](./java-quarkus-design-brief.md) (Schicht-Entwurf), [`java-quarkus-appmanager-brief.md`](./java-quarkus-appmanager-brief.md) (App-Manager + Delivery). Der alte Bash-in-place-Plan [`refactoring-plan.md`](./refactoring-plan.md) ist **superseded**.
 
 ---
 
-## 1. Zielbild in einem Satz
+## 1. Die zwei Kern-Anforderungen (und wie der Plan sie erfüllt)
 
-Aus ~10 000 Zeilen dynamischem Bash wird **eine typisierte, DI-verdrahtete Java-Anwendung**, die zu **einem nativen Binary** kompiliert (schneller Start, kein JVM/Runtime nötig) und die **externen Tools (ansible, ansible-vault, terraform, git, docker) weiterhin per Prozessaufruf orchestriert**. Die Ansible-Playbooks, Docker- und Vault-Templates werden **nicht** zu Java — sie bleiben deklarative Assets, die als Classpath-Ressourcen eingebettet und zur Laufzeit von Java extrahiert und aufgerufen werden.
+| # | Anforderung | Umsetzung |
+|---|---|---|
+| **A** | **Ein-Befehl-Installation via GitHub-URL** auf Debian/Linux — Nutzer geben genau **einen** Bash-Befehl ein. | `curl -fsSL https://raw.githubusercontent.com/NiklasJavier/SOT/<ref>/install.sh \| bash` lädt das passende **vorgebaute native Binary** aus GitHub Releases, verifiziert (SHA-256 + cosign) und legt `sot` auf den PATH. Kein JVM, kein Build beim Nutzer. → §3 |
+| **B** | **Dynamischer App-Manager**: App-Selektor im CLI, eigene Anwendungen installieren/updaten **über alle Apps hinweg**, mit **Update-Überwachung**, „tief dynamisch". | Apps sind **deklarative Manifeste** (`app.yml`) aus einem **konfigurierbaren Katalog-Repo**, orchestriert von einem festen Satz **Install-Strategien**. Neue App = Manifest hinzufügen, **kein Rebuild**. Ein `UpdateMonitor` prüft quellenübergreifend „veraltet?". → §2 |
 
-**Warum das die 88 Bugs erschlägt:** Die überwältigende Mehrheit der Befunde sind **Artefakte des Bash-Modells** — String-Dispatch, `source`-Laden, Wort-Splitting, positionale argv-Übergabe, YAML-Parsing per `cut`/`xargs`, CI per Verzeichnis-Glob. In einem **typisierten, CDI-verdrahteten Single-Binary-Design sind diese Bug-Klassen per Konstruktion unmöglich** (siehe Mapping §5). Ein kleiner Rest bleibt echtes Engineering (native-image-Constraints, Secret-Handling, Linking) — der wird in §7/§9 explizit adressiert.
-
-**Was ausdrücklich NICHT verschwindet:** Die **Ansible-Modul-Bugs (Befund-Thema L, 10 Stück** — UFW `policy: allow`, `readVaultParameter`-Rollenname, `/etc/hosts`-Regex, Vault-Passwort-Lifecycle, OS-Abstraktion …) leben in den Playbooks weiter, weil Ansible bleibt. Sie müssen **bei der Portierung der YAML-Assets aktiv gefixt** werden — der Java-Umbau löst sie nicht auf. (Eigener Task in Phase 6.)
+**Der architektonische Kniff (löst „tief dynamisch" vs. GraalVM-Closed-World):** GraalVM native-image ist **Closed-World** — kein Laden neuer Java-Klassen zur Laufzeit. „Tief dynamisch" heißt daher **nicht** „Java-Plugins nachladen", sondern: die **Menge der Strategien** (git/docker-compose/release-binary/deb/script) ist fest **einkompiliert**; **welche Apps existieren** und ihre gesamte Konfiguration sind **100 % Laufzeit-Daten** (Manifeste aus git/HTTP). So ist das System voll dynamisch **ohne** die Closed-World-Annahme zu verletzen.
 
 ---
 
-## 2. Ziel-Stack
+## 2. Kern-Zweck: Der dynamische App-Manager
+
+### 2.1 Zwei getrennte Achsen (das zentrale Designprinzip)
+
+Bash vermischte „**woher** kommt eine App-Definition" mit „**wie** wird sie installiert". Java trennt sie:
+
+- **`CatalogSource` — WOHER (100 % Laufzeit-Daten).** Ein konfigurierbarer Satz Kataloge: `git` (dein Katalog-Repo), `http-index` (ein Index-URL), `bundled` (eingebettete Default-Apps). Zur Laufzeit gefetcht, nach `priority` gemerged. Neue App = `app.yml` in den Katalog legen.
+- **`InstallStrategy` — WIE (fest einkompiliert).** Fünf CDI-Beans hinter **einem** Interface: `git-repo`, `docker-compose`, `github-release-binary`, `apt-deb`, `script`. Neue Strategie = Bean hinzufügen (Rebuild). Jede delegiert an die geteilte `ProcessRunner`/`GitService`/`GitHubReleaseClient` — kein Neuimplementieren von exec.
+
+Das **subsumiert die alte Extension/Plugin-Schicht**: eine „Extension" (AAT/TID) ist jetzt einfach eine App mit einem `runner:`-Block. `CapabilityService`→`AppService`, `CapabilityStateStore`→`InstalledAppStore`, `module.yml`→`app.yml`. Ein Vokabular.
+
+### 2.2 Das App-Manifest (`app.yml`) — die deklarative Einheit
+
+```yaml
+apiVersion: sot.dev/v1
+kind: App
+id: grafana                     # katalog-eindeutige, stabile ID
+name: Grafana
+description: Monitoring dashboards
+category: observability
+labels: [monitoring, ui]
+source:                         # WIE installieren → wählt die InstallStrategy
+  type: docker-compose          # git-repo | docker-compose | github-release-binary | apt-deb | script
+  repoUrl: https://github.com/owner/grafana-stack
+  ref: v10.4.0
+  composeFile: docker-compose.yml
+version:                        # WIE „neueste Version" bestimmen → wählt den VersionResolver
+  strategy: docker-image        # github-release | git-tag | docker-image | apt | static | script
+  constraint: '>=10.0.0 <11.0.0'
+  tagPattern: '^v(\d+\.\d+\.\d+)$'
+requires:                       # topologisch vor der Installation aufgelöst
+  tools: [docker]
+  apps:  [prometheus]
+  os:    [debian, ubuntu]
+install:
+  path: '{appsRoot}/grafana'    # via SotPaths getemplatet
+  env:  { GF_PORT: '3000' }
+  hooks: { postInstall: scripts/post.sh }
+runner:                         # OPTIONAL — vorhanden ⇒ App ist eine AAT/TID-artige Ansible-Extension
+  playbooks: [site.yml]
+```
+
+Ein Katalog listet seine Apps in einer `index.yml` (`id → manifest-Pfad + denormalisierte Version` für schnelles Listing). Der installierte Zustand lebt getrennt in `installed.yml` (0600, atomar geschrieben): installierte Version, Quelle, Pfad, Pin-Status, Checksum.
+
+### 2.3 Die eine Install-Strategie-Schnittstelle
+
+```java
+public interface InstallStrategy {
+  AppSourceType type();                                      // GIT_REPO | DOCKER_COMPOSE | GITHUB_RELEASE_BINARY | APT_DEB | SCRIPT
+  ResolvedSource resolve(AppManifest m, InstallContext ctx); // bindet+validiert source.options (raw JsonNode → typisierte Slice)
+  InstallOutcome install(ResolvedSource s, InstallContext ctx);
+  InstallOutcome update (ResolvedSource s, InstalledApp cur, InstallContext ctx);
+  void           remove (InstalledApp cur, InstallContext ctx);
+}
+// Verdrahtung: @All List<InstallStrategy> → Map<AppSourceType,InstallStrategy> zur BUILD-Zeit (Closed-World)
+```
+
+`AppService` ist der einzige Lifecycle-Owner: `list/search/info/install(topo-resolve requires.apps)/update/upgradeAll/remove/pin/unpin/outdated`. Er wählt die Strategie aus der `Map<AppSourceType,…>` und persistiert über `InstalledAppStore`.
+
+### 2.4 Update-Überwachung (das „überwacht, ob geupdated werden kann")
+
+Getrennte Achse `de.jklein.sot.app.update`: ein **`VersionResolver`-SPI** je Quelltyp (`UpdateStrategy` = `GITHUB_RELEASE | GIT_TAG | DOCKER_IMAGE | APT | STATIC | SCRIPT`), ebenfalls `@All`-injiziert. `InstallStrategy.update()` **ruft** den passenden `VersionResolver` — kein doppeltes „latest"-Design.
+
+```java
+interface VersionResolver { UpdateStrategy strategy(); ResolvedVersion resolveLatest(VersionQuery q, ResolverContext ctx); }
+record ResolvedVersion(Optional<Version> latest, String rawLatest, Optional<String> digest, Instant at, CacheDisposition cache) {}
+enum UpdateStatus { UP_TO_DATE, UPDATE_AVAILABLE, PINNED, UNKNOWN, NOT_INSTALLED }
+record OutdatedReport(Instant generatedAt, List<AppUpdateReport> apps, int upToDate, int updatable, int pinned, int unknown) {}
+```
+
+- **`UpdateMonitorService.checkAll()`** fächert `resolveLatest()` über **Virtual Threads** (StructuredTaskScope + Semaphore) über **alle installierten Apps**, vergleicht eine **hand-gerollte, native-sichere `SemVer`** gegen die installierte Version unter Berücksichtigung von `constraint` + Pin, und faltet in einen `OutdatedReport`. Fehler je App → `UNKNOWN`, nie Abbruch.
+- **Kein Daemon.** Das Binary ist kurzlebig (schneller Start ist der Punkt). `sot bootstrap` installiert einen **systemd-Timer** (Cron-Fallback), der `sot app check --quiet --notify` tickt; der Tick schreibt `last-check.json`, `UpdateNotifier` meldet nur bei **Zustandsänderung**. `sot app status`/`outdated` lesen den Cache für sofortige Offline-Anzeige (Netz nur bei `--refresh`).
+- **Robust gegen die Realität:** ETag-Conditional-GETs + TTL-Cache + Serve-Stale bei Rate-Limit; nicht-semver-Tags (calver/sha/`:latest`) werden per **Gleichheit/Digest** verglichen (keine erfundene Ordnung); Pins (`installed.yml`, nicht Manifest): EXACT→eingefroren, RANGE→Update nur innerhalb der Range.
+
+### 2.5 Der App-Selektor (die Bedien-Oberfläche)
+
+Ein Picocli-Parent `sot app` (Aliase `apps`, `a`) — **die eine Vokabel** für das, was früher extensions/plugins/capabilities war. Bare auf einem TTY startet der interaktive Selektor; bare in einer Pipe druckt `list` (blockiert nie).
+
+```
+sot app                      # TTY → interaktiver Selektor · Pipe → list
+sot app browse | select      # Selektor explizit (für Skripte/Tests)
+sot app list [--json] [--outdated] [--role runner]      (alias ls)
+sot app search <query>       # fuzzy über alle Kataloge
+sot app info <id> [--json]   # Manifest, Quelle, installiert/verfügbar, Dep-Baum
+sot app install <id>[@version]… [--yes] [--dry-run]     (alias add, i)
+sot app update <id> | --all [--yes]                     (alias up)   # überspringt Pins
+sot app outdated [--json] [--cached]                    (alias stale) # ← Monitoring-Fläche
+sot app status [<id>]        # Dashboard: up-to-date/outdated/pinned/unknown/broken
+sot app check [--quiet] [--notify] [--refresh]          # Timer-/Refresh-Einstieg
+sot app remove <id> [--yes]                             (alias rm, uninstall)
+sot app pin <id>[@version|range] | sot app unpin <id>
+sot app catalog list | add <url> | remove <id> | refresh   (alias: sot app refresh)
+sot ex …                     # lebendiger Alias: Filter role=runner (AAT/TID-Muscle-Memory)
+sot extensions… | sot plugins…   # deprecated Forwarder → app list/install (mit Hinweis)
+```
+
+Der `AppSelector` ist bewusst **zeilenorientiert** (nummerierte Tabelle via `ConsoleService` + `BufferedReader`-Loop: Zahlen togglen, `/query` fuzzy, `a` alle, `i` install, `u` update, Enter bestätigen, `q` quit). **Kein JLine/ncurses/`stty`** → trivial GraalVM-native-sicher; bei `System.console()==null` verweigert er und fällt auf `list`. Globale Automations-Flags (`--json`, `--yes`, `--no-color`, `--catalog`, `--dry-run`) via `scope=INHERIT`.
+
+---
+
+## 3. Installation: der eine Befehl (Anforderung A)
+
+Zwei Ebenen — **Ebene 1** ist der geforderte Ein-Zeiler, **Ebene 2** hält aktuell:
+
+```bash
+# System-weit (→ /usr/local/bin/sot)
+curl -fsSL https://raw.githubusercontent.com/NiklasJavier/SOT/<ref>/install.sh | sudo bash
+# Per-User (→ ~/.local/bin/sot)
+curl -fsSL https://raw.githubusercontent.com/NiklasJavier/SOT/<ref>/install.sh | bash
+# Version pinnen (umgeht die GitHub-API, deterministisch)
+SOT_VERSION=v1.2.0 curl -fsSL …/install.sh | bash
+```
+
+**`install.sh`** (die **einzige** verbleibende Shell, `set -euo pipefail`, shellcheck-gegated):
+
+```bash
+REPO=NiklasJavier/SOT
+os=$(uname -s | tr A-Z a-z)                          # linux|darwin
+arch=$(uname -m); case $arch in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac
+tag=${SOT_VERSION:-$(curl -fsSL https://api.github.com/repos/$REPO/releases/latest | grep -m1 tag_name | cut -d'"' -f4)}
+base=https://github.com/$REPO/releases/download/$tag ; asset=sot-$os-$arch
+curl -fsSL -o "$tmp/$asset" "$base/$asset" ; curl -fsSL -o "$tmp/$asset.sha256" "$base/$asset.sha256"
+( cd "$tmp" && sha256sum -c "$asset.sha256" )        # Pflicht
+command -v cosign >/dev/null && cosign verify-blob --certificate "$asset.pem" --signature "$asset.sig" \
+  --certificate-identity-regexp 'https://github.com/NiklasJavier/SOT/.+' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com "$tmp/$asset"   # best-effort
+if [ -w /usr/local/bin ] || command -v sudo >/dev/null; then dest=/usr/local/bin; else dest=$HOME/.local/bin; mkdir -p "$dest"; fi
+${SUDO} install -m755 "$tmp/$asset" "$dest/sot"      # dann: Hinweis „sot bootstrap" / PATH
+```
+
+- **Debian-spezifisch:** installiert **nur** das `sot`-Binary (setzt `curl`/`ca-certificates` voraus). Laufzeit-Tools (git/ansible/docker) werden **nicht** still per apt gezogen — `sot doctor`/`sot bootstrap` erkennen/melden sie (D19).
+- **Fallbacks:** `/usr/local/bin` nicht schreibbar → `~/.local/bin` + PATH-Hinweis; darwin → „build-from-source/JVM"-Meldung statt 404 (v1 shippt linux amd64/arm64).
+- **Ebene 2 — `sot self-update`:** in-Binary, nutzt denselben Asset-/Verify-Kontrakt (GitHub-Release → SHA-256 + cosign → Sibling-Temp → `ATOMIC_MOVE` → re-exec).
+- **Asset-Namens-Kontrakt** (single-sourced zwischen JReleaser und `install.sh`): `sot-<os>-<arch>` + `.sha256` + `.sig` + `.pem`, plus `checksums_sha256.txt`, `sbom.syft.json`.
+
+---
+
+## 4. Ziel-Stack
 
 | Ebene | Wahl | Warum |
 |---|---|---|
-| Sprache | **Java 21** (LTS) | Records, sealed types, virtual threads, Pattern Matching — ideal für typisierte Config & Prozess-Draining |
-| Framework | **Quarkus 3.37+** | Auf GraalVM native zugeschnitten; Build-Time-DI (Arc) statt Runtime-Scanning → passt zur Closed-World-Annahme von native-image |
-| CLI | **quarkus-picocli** (Picocli) | Deklarativer Command-Baum, CDI-Injektion in Commands, `AutoComplete.GenerateCompletion` erzeugt bash/zsh-Completion aus dem lebenden Spec |
-| Config | **quarkus-jackson + jackson-dataformat-yaml** | Ein Parser (SnakeYAML-Tokenizer) statt 4 Bash-Parser; typisierte Records; `#`/Quote/Backslash-Korruption unmöglich |
-| Validierung | **quarkus-hibernate-validator** | Bean-Validation auf Config-Records (Port-Range, Namens-Pattern) |
-| Templating | **quarkus-qute** (`@CheckedTemplate`) | Typsicheres Vault-Template ohne Runtime-Reflection (native-freundlich) |
-| Native | **Mandrel/GraalVM CE 21** (`-Dnative`) | Ein Binary je Plattform; `quarkus.native.resources.includes` bettet Assets ein |
-| Build | **Maven** (+ Wrapper) | Quarkus-Primärtoolchain; `mvn …:create -Dextensions='picocli'` |
-| Release | **JReleaser** + GitHub Actions Matrix | Per-Plattform-Binaries, Checksums, SBOM (Syft), Signaturen (cosign) auf GitHub Releases |
-| Verbleibende Shell | **genau ein** `install.sh` | Erkennt OS/Arch, lädt das passende Binary + Checksum, verifiziert, verlinkt |
+| Sprache | **Java 21** (LTS) | Records, sealed types, **virtual threads** (Update-Fan-out), Pattern Matching |
+| Framework | **Quarkus 3.37+** | Für GraalVM native gebaut; Build-Time-DI (Arc) → passt zur Closed-World |
+| CLI | **quarkus-picocli** | Command-Baum, CDI-Injektion, `AutoComplete.GenerateCompletion` (bash/zsh aus dem Spec) |
+| Config/Manifest | **quarkus-jackson + jackson-dataformat-yaml** | Ein Parser; typisierte Records; `#`/Quote/Backslash-Korruption unmöglich |
+| Validierung | **quarkus-hibernate-validator** | Bean-Validation auf Config-/Manifest-Records |
+| Templating | **quarkus-qute** (`@CheckedTemplate`) | Typsicheres Vault-Template, reflection-frei |
+| Native | **Mandrel/GraalVM CE 21** | `-H:+StaticExecutableWithDynamicLibC` (**mostly-static glibc**, nicht musl — s. §7/D1); `resources.includes` bettet Assets ein |
+| **Build** | **Gradle (Groovy DSL)** | *(vom Owner gewählt statt Maven)* Quarkus-Gradle-Plugin; `./gradlew build -Dquarkus.native.enabled=true` |
+| **Dev-Frontend** | **Justfile** (`just`) | *(vom Owner gewählt)* wrappt die Default-Befehle für optimale Ersteinrichtung |
+| Release | **JReleaser (Gradle-Plugin)** + GitHub Actions | Per-Plattform-Binaries, Checksums, SBOM (Syft), cosign auf GitHub Releases |
 
-**Bootstrap-Kommandos (verifiziert):** Projekt: `mvn io.quarkus.platform:quarkus-maven-plugin:3.37.0:create -DprojectGroupId=de.jklein.sot -DprojectArtifactId=sot -Dextensions='picocli,quarkus-jackson'`. Native-Build: `./mvnw install -Dnative` (bzw. `-Dquarkus.native.enabled=true`). Completion: `source <(sot generate-completion)`.
+**Scaffolding & Build (verifiziert gegen aktuelle Quarkus-Docs):**
+```bash
+quarkus create cli de.jklein.sot:sot --gradle -x picocli          # Gradle-Projekt (Groovy DSL)
+./gradlew addExtension --extensions='quarkus-jackson,quarkus-hibernate-validator,quarkus-qute'
+./gradlew quarkusDev                                              # Live-Reload
+./gradlew build                                                   # JVM-Jar + Tests
+./gradlew build -Dquarkus.native.enabled=true                    # natives Binary
+./gradlew check                                                   # Tests + Int-Tests + JaCoCo (CI-Gate)
+./gradlew jreleaserFullRelease                                   # Release (Binaries/Checksums/SBOM/cosign)
+```
+
+Native-Flags gehören in `application.properties` (nicht `build.gradle`):
+```properties
+quarkus.native.builder-image=quay.io/quarkus/ubi9-quarkus-mandrel-builder-image:jdk-21
+quarkus.native.container-build=true
+quarkus.native.additional-build-args=-H:+StaticExecutableWithDynamicLibC   # mostly-static glibc (fork/exec-sicher), NICHT --libc=musl
+quarkus.native.resources.includes=apps/**,ansible/**,docker/**,templates/**,config/**,assets/manifest.txt
+quarkus.native.add-all-charsets=true
+```
+
+**Justfile** (Entwickler-Entrypoint, wrappt `./gradlew`):
+```
+setup · dev · build · native · test · lint · fmt · run *ARGS · install-local · release TAG · clean
+apps → sot app list · install <id> → sot app install <id> · check → sot app check --refresh · install-timer
+```
 
 ---
 
-## 3. Ziel-Architektur
-
-### Schichten
-
-```mermaid
-graph TD
-    IN[install.sh + prebuilt native binary] --> CLI
-    subgraph CLI["cli/ — Picocli-Command-Baum (einzige Dispatch-Fläche)"]
-      ROOT["SotCommand @TopCommand + Main @QuarkusMain"]
-    end
-    CLI --> SVC
-    subgraph SVC["Services (CDI-Beans, per Konstruktor injiziert)"]
-      CFG[config/ ConfigService · SotConfig-Records]
-      EXT[extension/ CapabilityService · Provider-Strategien]
-      VLT[vault/ VaultService · Secret-Typ]
-      BOOT[bootstrap/ TaskRunner · SelfUpdate]
-      DOC[doctor/ DoctorService]
-    end
-    SVC --> PROC
-    subgraph PROC["process/ + runner/ — Prozess-Orchestrierung"]
-      PR[ProcessRunner] --> EXTTOOLS
-      GIT[GitService.gitSync]
-    end
-    subgraph RT["runtime/ — Foundation"]
-      YAML[YamlMapperProducer] 
-      PATHS[SotPaths]
-      ASSET[AssetExtractor]
-      REFL[ReflectionConfig]
-    end
-    SVC --> RT
-    PROC --> RT
-    EXTTOOLS["ansible · ansible-vault · terraform · git · docker  (externe Prozesse)"]
-    ASSET -.extrahiert.-> RES["src/main/resources: ansible/ docker/ templates/ modules/"]
-```
+## 5. Ziel-Architektur
 
 ### Package-Baum (`de.jklein.sot.*`)
 
 ```
 de.jklein.sot/
-├── cli/         Picocli-Command-Baum: SotCommand(@TopCommand) · Main(@QuarkusMain) · {Bootstrap,Doctor,Vault,
-│               Runner,Extensions,Plugins,Update,Delete,Interactive}Command · SotVersionProvider · AliasExpander
-│               · AliasCheatSheetRenderer · ConsoleService/ProgressReporter · SotExitCode
-├── config/      SotConfig + {System,Ssh,Logging,Paths,Tools,Ansible,Runner,Vault}Config · ExtensionConfig
-│               · GeneratedValue(enum) · YamlConfigCodec · ConfigMerger · PlaceholderResolver · ConfigValidator
-│               · SecretStore · ConfigService   (EINE kanonische, verschachtelte, typisierte Schema-Quelle)
-├── extension/   CapabilityProvider(interface) · LocalDirectoryProvider · RemoteGitProvider · CapabilityRegistry
-│               · CapabilityService · ExtensionManifest · Capability · CapabilityType · CapabilityStateStore
-│               · ManifestParser · SafeFsRemover   (module=plugin=extension=integration → EIN Konzept)
-├── vault/       Secret(AutoCloseable char[]) · VaultPasswordSource(sealed) · SecretResolver · TransientPasswordFile
-│               · PosixGuards · AnsibleVaultRunner · SecretGenerator · VaultTemplateRenderer · VaultSecrets · VaultService
-├── process/     ProcessRunner(interface)+Impl · ProcessSpec/ProcessResult · ProgressSink/TeeSink · SecretMaterializer
-│               · GitService/GitSyncSpec · WorkspaceManager · ToolPreflight
-├── runner/      AnsiblePlaybookInvocation · AnsibleVaultInvocation · TerraformInvocation · DockerInvocation (typed arg-builder)
-├── bootstrap/   BootstrapTask(interface) + {Preflight,MaterializeAssets,DirectoryLayout,DependencyInstall,VaultReference,
-│               Finalize}Task · TaskRunner · TaskResult/BootstrapReport · InstallLayout · DependencyInstaller
-│               · GitHubReleaseClient · ChecksumVerifier · BinaryUpdater · BuildInfo
+├── cli/         Picocli-Baum: SotCommand(@TopCommand)·Main(@QuarkusMain)·{Bootstrap,Doctor,Vault,Runner,Update,Delete,Interactive}Command
+│               · SotVersionProvider · AliasExpander · ConsoleService/ProgressReporter · SotExitCode
+│   └── app/     App-Selektor-UX: AppCommand(app|apps|a) · AppSelector(zeilenorientiert) · AppTableRenderer · SelectionState
+│               · App{Select,List,Search,Info,Install,Update,Outdated,Status,Remove,Pin,Unpin,Refresh}Command · AppNameCandidates
+│               · ExtensionsCommand/PluginsCommand (deprecated Forwarder)
+├── app/         ★ KERN: AppManifest · SourceSpec · AppSourceType(enum) · InstallStrategy(interface)
+│               · {GitRepo,DockerCompose,GithubReleaseBinary,AptDeb,Script}Strategy · AppCatalog · CatalogSource · CatalogIndex
+│               · InstalledAppStore · InstalledApp · AppService · AppStatus · SemVer · RunnerSpec
+│   └── update/  UpdateMonitorService · VersionResolver(interface) · {GitHubRelease,GitTag,DockerImage,AptPolicy,Script}Resolver
+│               · Version/VersionConstraint · VersionCache · AppUpdateReport/OutdatedReport · UpdateScheduler/UpdateNotifier · InstalledApps(port)
+├── config/      SotConfig + Sektions-Records (System/Ssh/Logging/Paths/Tools/Ansible/Runner/Vault) · CatalogSource-Liste
+│               · YamlConfigCodec · ConfigMerger · PlaceholderResolver · ConfigValidator · SecretStore · ConfigService
+├── vault/       Secret(AutoCloseable) · VaultPasswordSource(sealed) · SecretResolver · TransientPasswordFile · PosixGuards
+│               · AnsibleVaultRunner · SecretGenerator · VaultTemplateRenderer · VaultSecrets · VaultService
+├── process/     ProcessRunner(interface)+Impl · ProcessSpec/Result · ProgressSink/TeeSink · SecretMaterializer
+│               · GitService/GitSyncSpec · GitHubReleaseClient · ChecksumVerifier · WorkspaceManager · ToolPreflight
+├── runner/      AnsiblePlaybookInvocation · AnsibleVaultInvocation · TerraformInvocation · DockerInvocation
+├── bootstrap/   BootstrapTask(interface)+Task-Beans · TaskRunner · TaskResult/BootstrapReport · InstallLayout
+│               · DependencyInstaller · SelfUpdateCommand · BinaryUpdater · BuildInfo
 ├── doctor/      DoctorService
 └── runtime/     YamlMapperProducer · SotPaths · AssetExtractor · ReflectionConfig
 
 src/main/resources/   application.properties · config/default_config.yml · templates/vault/secrets.yml (Qute)
-                      · ansible/** · docker/** · modules/**/module.yml · assets/manifest.txt (build-generiert)
-repo-root/            pom.xml · mvnw · install.sh · jreleaser.yml · .pre-commit-config.yaml
-                      · .github/workflows/{ci,native-build,release}.yml
+                      · apps/**/app.yml (gebündelte Default-Apps) · ansible/** · docker/** · assets/manifest.txt (build-generiert)
+repo-root/            build.gradle · settings.gradle · gradle.properties · gradlew · Justfile · install.sh
+                      · jreleaser (Gradle-Plugin) · .pre-commit-config.yaml · .github/workflows/{ci,native-build,release}.yml
 ```
 
-### Sieben Architektur-Prinzipien
+### Schichten-Diagramm
 
-1. **Ein Dispatch-Pfad.** `CommandLine.execute(args)` in `Main`. Kein `case`, kein Registry-vs-Filesystem-Dual, keine leeren Command-Pfade. Aliase sind `@Command(aliases=…)` — ein toter Alias ist **nicht kompilierbar**.
-2. **State per Konstruktor-Injektion, nie per argv.** Der positionale `CLI_METADATA_ARGS`-Contract (R3) existiert nicht mehr; Commands bekommen `SotConfig`, `SotPaths`, `VaultService` etc. als typisierte Beans.
-3. **Ein YAML-Parser, ein Schema.** `YamlMapperProducer` liefert **den einen** Jackson-`YAMLMapper`; Config sind unveränderliche Records. Die 4 Bash-Parser und das v1/v2-Schisma sind weg.
-4. **Ein Erweiterungs-Konzept.** `CapabilityProvider` mit zwei Strategien (lokales Verzeichnis / entferntes Git-Repo) hinter **einer** Registry + einem Lifecycle. `integration`-Typ und Legacy-Kommando entfallen.
-5. **Secrets sind ein Typ, kein String.** `Secret` (AutoCloseable `char[]`, `toString()="****"`, `close()` nullt) — nie auf argv, nie im Config-YAML, nie im Log. `no_log` wird zur Typ-Eigenschaft.
-6. **Ein Install-Root, ein Binary.** Alle Pfade aus **einem** `rootDir`. Kein Doppel-Clone, kein `/opt/AAT`-Fallback, kein CLI-Sed-Patch. Der ausgeführte CLI **ist** der installierte.
-7. **Build-Time-Wahrheit.** Command-Baum, Provider-Liste, Task-Liste, Completion, Hilfe, Version werden zur **Build-Zeit** aufgelöst (Closed-World). Erweitern = ein Bean hinzufügen, nicht ein `.sh` zur Laufzeit ablegen.
+```mermaid
+graph TD
+    IN["curl … install.sh | bash → natives sot-Binary"] --> CLI
+    subgraph CLI["cli/ + cli/app/ — Picocli + App-Selektor"]
+      ROOT["SotCommand @TopCommand"] --> APPC["AppCommand (Selektor/list/install/update/outdated)"]
+    end
+    APPC --> AS["app/ AppService (Lifecycle-Owner)"]
+    AS --> CAT["AppCatalog (git/http/bundled — Laufzeit-Daten)"]
+    AS --> STR["InstallStrategy ×5 (einkompiliert)"]
+    AS --> UPD["app.update/ UpdateMonitorService"]
+    UPD --> VR["VersionResolver ×5"]
+    STR --> PROC["process/ ProcessRunner · GitService · GitHubReleaseClient"]
+    VR --> PROC
+    ROOT --> OTHER["config/ · vault/ · bootstrap/ · doctor/"]
+    PROC --> EXT["ansible · git · docker · apt · terraform (externe Prozesse)"]
+    AS --> RT["runtime/ SotPaths · YamlMapper · AssetExtractor · ReflectionConfig"]
+    CAT -.Manifeste.-> CATREPO["Katalog-Repo (app.yml, index.yml) — extern, dynamisch"]
+```
+
+### Sieben Prinzipien
+1. **Zwei Achsen getrennt:** Kataloge (Daten, dynamisch) vs. Strategien (Beans, einkompiliert) → tief dynamisch trotz Closed-World.
+2. **Ein Dispatch-Pfad** (`CommandLine.execute`), ein Vokabular (`sot app`), tote Aliase nicht kompilierbar.
+3. **State per Konstruktor-Injektion**, nie positional argv (R3 aufgelöst).
+4. **Ein YAML-Parser, ein Schema** — Config & Manifeste durch denselben typisierten `YAMLMapper`.
+5. **Secrets sind ein Typ** (`Secret`), nie auf argv/Config/Log.
+6. **Ein Install-Root, ein Binary** — alle Pfade aus `SotPaths`; der ausgeführte CLI ist der installierte.
+7. **Build-Time-Wahrheit** — Command-Baum, Strategien, Resolver, Tasks zur Build-Zeit aufgelöst (`@All`).
 
 ---
 
-## 4. Was sich **nicht** ändert (Scope-Grenze)
+## 6. Capability-Mapping: Bash → Java
 
-- **Ansible / Terraform / Docker bleiben.** Sie werden als externe Prozesse orchestriert; Playbooks/Rollen/Templates sind eingebettete Assets. „Alles auf Java" heißt: **die gesamte Shell-Logik** wird Java — nicht die deklarativen Infrastruktur-Artefakte (die zu Java zu machen wäre absurd).
-- **Die Ziel-Fähigkeiten** (bootstrap, doctor, vault, runner, extensions, plugins, update/self-update, delete, help, version, interactive, completion) bleiben identisch aus Nutzersicht — nur robuster und sicherer.
-- **YAML als Config-Format** bleibt (verschachtelt), nur eben typisiert geladen.
+**Legende:** **[S]** = löst sich *strukturell* auf · **[C]** = *bewusst zu härten* · **[L]** = *manuell in den Ansible-Assets zu fixen*.
 
----
-
-## 5. Capability-Mapping: Bash → Java
-
-**Legende:** **[S]** = löst sich *strukturell* auf (das Java-Design macht den Befund per Konstruktion unmöglich) · **[C]** = braucht *bewusste Härtung* (Restrisiko bleibt, wird mitigiert — siehe §7/§9).
-
-| Bash-Datei / Subsystem | Ersetzt durch (Java) | Grundursache / Thema |
+| Bash | Java-Ersatz | Grundursache |
 |---|---|---|
-| `bin/sot` (Pfad-Bootstrap, `CLI_METADATA_ARGS`, `case`-Dispatch, `resolve_command_path`, interaktiv) | `cli.Main` + `SotCommand`-Baum + Konstruktor-Injektion | **R3** positional argv; **A** Doppel-Dispatch — [S] |
-| `lib/cli/registry.sh` (register/help/menu/completion-Gen) | `SotCommand`-Baum + `AliasCheatSheetRenderer` + `InteractiveCommand` | **A/I** Registry-vs-FS; Hilfe-Drift; leere Plugin-Pfade — [S] |
-| `lib/cli/aliases.sh` | picocli `@Command(aliases=…)` + `AliasExpander` | **F** toter `s`→setup-127-Exit; tote/Multi-Wort-Aliase — [S] |
-| `lib/cli/progress.sh`, `colors.sh` + 6 kopierte ANSI-Blöcke | `cli.ConsoleService` / `ProgressReporter` (ein Binary) | **R6** Farb-Duplikation; **E** — [S] |
-| `completions/*.{bash,zsh}` | picocli `AutoComplete.GenerateCompletion` | **R7/I** Completion-Triplikation + Drift — [S] |
-| `lib/core/yaml_parser.sh`, `parse_plugin_yaml`, `config_defaults`-Regex, `default_config{,_v2}.yml` | `YamlConfigCodec` + `YamlMapperProducer` + **ein** `default_config.yml` + `SotConfig`-Records | **R1** 4 Parser/Schema-Split; **D** flach-vs-verschachtelt; **G** `#`-Truncation/`xargs`-Korruption; **H** `PATH`/`IFS`-Key-Injection — [S] |
-| `config_defaults.sh` (`generate_dynamic_defaults`) | `PlaceholderResolver` + `GeneratedValue` + `ConfigValidator`-Gate | **F** `__GENERATE_SCRIPTS_DIR__` landet auf Disk — [S] |
-| `config_writer.sh`, `sed`, `save_plugin_state`, `overrides/` | `ConfigService.save` + `ConfigMerger` | **D** 3 Mutations-Pfade + unimplementierte Overrides — [S] |
-| `lib/plugins/manager.sh` + `lib/extensions/manager.sh` + `commands/extensions.sh` (3 Manager, 4 Begriffe) | `CapabilityRegistry` + `CapabilityService` + `CapabilityProvider`-Strategien | **R2/B** vier Begriffe, drei disjunkte Subsysteme — [S] |
-| `modules/*/module.yml`, `parse_plugin_yaml`, `PLUGIN_DEPENDENCIES` | `ExtensionManifest` + `ManifestParser`; topologische Dep-Auflösung | **B** Schema-vs-Parser; ignorierte Deps; Typ-Taxonomien — [S] |
-| `_update_config_value` / `save_plugin_state` (persistiert nie) | `CapabilityStateStore` | **B/F** Persistenz-Lüge — [S] |
-| `commands/vault.sh`, `roles/{vault,read_vault_parameter}`, `vault_template.j2` | `VaultService` + `AnsibleVaultRunner` + `Secret` + `TransientPasswordFile` + `VaultTemplateRenderer` | **R5/H** Secret auf argv, Klartext in Config, persistente `vault_pass.txt`, Debug-Dump, schwache Defaults, fehlende view/rekey — [S]; Symlink-Race, tmpfs-Garantie, Secure-Delete — [C] |
-| `commands/runner.sh` (ansible/terraform, tee, sync_repo), `trigger.sh` | `ProcessRunner` + `runner.*Invocation` + `TeeSink` + `ToolPreflight` | **R3/R6** positional argv + duplizierter Arg-Bau — [S] |
-| Git-Clone (`init.sh`/`tasks.sh`), `manager.sh` fetch+pull, `update.sh` `reset --hard`+`clean` | `GitService.gitSync(GitSyncSpec, PULL/RESET_HARD)` | **R6** 4 Git-Sync-Stellen; **G** ungeschützter Reset — [S]; RESET_HARD-Datenverlust — [C] |
-| `bootstrap/init.sh` curl\|bash Selbst-Clone + re-exec + re-clone | `install.sh` (dünn) + Prebuilt-Binary + `InstallLayout` | **R4** zwei Roots; **C** Selbst-Clone/CLI-Edit/`SETUP_DIR` — [S]; Root-Default-Wahl — [C] |
-| `bootstrap/{tasks,runner,args_parser}.sh` | `BootstrapTask`-Beans + `TaskRunner` + `BootstrapReport` | **F** „immer erfolgreich"-Lüge; unparste `$1/$2` — [S] |
-| `bootstrap/dependencies.sh` | `DependencyInstaller`-Strategien | **F** still verworfene `-tools`-Tokens — [S] |
-| `commands/maintenance/update.sh` | `SelfUpdateCommand` + `BinaryUpdater` + `ChecksumVerifier` + `GitHubReleaseClient` | **G/H** ungeschützter Reset; unverifiziertes Update — [S]; Cross-Device-Move, TLS/CA — [C] |
-| `commands/maintenance/delete.sh` (safe-delete, vault-backup) | `SafeFsRemover` + `PathGuardTest`-Denylist | **R5/H** `rm -rf` auf Config-Pfade + sed-Injection; Secret in `/tmp/BACKUP_INFO.txt` — [S] |
-| `lib/init.sh` Source-Loader/Doppel-Sourcing, `SOT_ROOT`-Probing | `runtime.SotPaths` + Arc-Bean-Graph | **R4/E** Load-Modell, Doppel-Source, `SCRIPT_ROOT`-Drift — [S] |
-| `modules/ansible/**`, Templates, Docker (loser Baum) | `src/main/resources/**` + `AssetExtractor` (+ `assets/manifest.txt`) | Asset-Embedding für native — [S]; Manifest-Vollständigkeit — [C] |
-| **`modules/ansible/roles/*` INHALT (UFW, Rollenname, hosts-Regex, Vault-Lifecycle, OS-Abstraktion)** | **portierte, gefixte Ansible-Assets** (bleiben YAML) | **Thema L (10 Befunde)** — **NICHT [S]/[C], sondern manuell zu fixen** ⚠️ |
-| `tests/*.sh` + Mock-`ansible-vault` | `@QuarkusTest` + `RecordingProcessRunner` + `FakeToolPathResource` + `ConfigRoundtripTest` + `VaultBehaviorTest` | **K** grep-String-Tests, `set -e`-Counter, Null-Coverage, bash≥4/macOS-3.2 — [S] |
-| `.github/workflows/{test,lint,security,deploy}.yml`, `.pre-commit-config` | `ci.yml` + `native-build.yml` + `release.yml` + `jreleaser.yml` | **R7** False-Green `security.yml` `\|\| true`, `ci/`-Drift; **I** — [S]; native musl/exec — [C] |
+| `bin/sot`-Dispatch, `CLI_METADATA_ARGS` | `cli.Main` + `SotCommand`-Baum + Konstruktor-Injektion | R3, A — [S] |
+| `lib/cli/{registry,aliases,progress}.sh`, `colors.sh` + 6 ANSI-Kopien, `completions/*` | `cli/` (Command-Baum, `ConsoleService`, `AutoComplete.GenerateCompletion`) | A/E/I/R6/R7 — [S] |
+| `lib/core/yaml_parser.sh` + 3 weitere Parser, `default_config{,_v2}.yml` | `YamlConfigCodec` + `YamlMapperProducer` + `SotConfig`-Records | R1/D/G/H — [S] |
+| `lib/plugins/manager.sh` + `lib/extensions/manager.sh` + `commands/extensions.sh` (3 Manager, 4 Begriffe) | **`app/` App-Manager** (`AppService`+`AppCatalog`+`InstallStrategy`) — Extension = App mit `runner:` | R2/B — [S] |
+| `modules/*/module.yml`, `parse_plugin_yaml`, `PLUGIN_DEPENDENCIES` | `AppManifest` + `ManifestParser` + topologische `requires.apps` | B — [S] |
+| `_update_config_value`/`save_plugin_state` (persistiert nie) | `InstalledAppStore` (typisiert, atomar) | B/F — [S] |
+| *(neu — Anforderung B)* Update-Überwachung | **`app.update/` `UpdateMonitorService` + `VersionResolver`-SPI** + systemd-Timer | neue Fähigkeit — [C] |
+| `commands/runner.sh`, `trigger.sh` | `process.ProcessRunner` + `runner.*Invocation` | R3/R6 — [S] |
+| Git-Sync (4×), `update.sh` `reset --hard` | `GitService.gitSync(PULL/RESET_HARD, --force-gated)` | R6/G — [S]; Datenverlust — [C] |
+| `commands/vault.sh`, Vault-Rollen, `vault_template.j2` | `vault.VaultService` + `Secret` + `TransientPasswordFile` + Qute | R5/H — [S]; tmpfs/Race — [C] |
+| `bootstrap/init.sh` curl\|bash Selbst-Clone | **`install.sh` (dünn) + Prebuilt-Binary** + `InstallLayout` | R4/C, A — [S]; Root-Wahl — [C] |
+| `bootstrap/{tasks,runner,args_parser,dependencies}.sh` | `BootstrapTask`-Beans + `TaskRunner` + `DependencyInstaller` | F — [S] |
+| `commands/maintenance/{update,delete}.sh` | `SelfUpdateCommand`/`BinaryUpdater` + `SafeFsRemover` | G/H — [S]; Cross-Device/TLS — [C] |
+| **`modules/ansible/roles/*` INHALT** (UFW `allow`, Rollenname, hosts-Regex, Vault-Lifecycle, OS) | **portierte, gefixte Ansible-Assets** (bleiben YAML) | **Thema L (10) — manuell [L]** ⚠️ |
+| `tests/*.sh` + Mock-vault | `@QuarkusTest`/`@QuarkusMainTest`/native-IT + `RecordingProcessRunner` | K — [S] |
+| `.github/workflows/*`, `.pre-commit` | `ci/native-build/release`.yml (Gradle) + JReleaser | R7/I — [S]; native musl/exec — [C] |
 
-**Bilanz der 88 Befunde:** ~geschätzt **60+ lösen sich strukturell [S]** (Themen A, B, D, E, F, I, J, K + R1/R2/R3/R4-Layout/R6/R7). **~8–10 brauchen bewusste Härtung [C]** (native Reflection/Ressourcen, Linking, Secret-Härtung, Legacy-Migration, Self-Replace, Manifest-Vollständigkeit). **10 (Thema L) lösen sich gar nicht** — sie müssen in den portierten Ansible-Assets **aktiv gefixt** werden (Phase 6).
+**Bilanz:** Der Großteil der 88 Befunde löst sich **strukturell [S]** auf; ~8–10 brauchen **Härtung [C]** (native Reflection/Ressourcen, Linking, Secrets, Legacy-Migration, Self-Replace, **Supply-Chain der Kataloge**, Update-Fan-out); **10 (Thema L)** sind manuell in den portierten Ansible-Assets zu fixen (Phase 7).
 
 ---
 
-## 6. Native-Image-Constraints (die echten Fallstricke)
+## 7. Native-Image-Constraints
 
 | Bereich | Was zu tun ist |
 |---|---|
-| **Reflection** | `@RegisterForReflection` auf **alle** Jackson-Records (`SotConfig` + Sektionen, `ExtensionManifest`, `VaultSecrets`, GitHub-Release-DTOs) **zentral in `ReflectionConfig`** — sonst Runtime-Fehler „missing constructor". Picocli-`IVersionProvider`/`IHelpSectionRenderer`/`IExitCodeExceptionMapper`/`GenerateCompletion` ebenfalls registrieren. |
-| **Ressourcen** | `quarkus.native.resources.includes=ansible/**,docker/**,templates/**,config/**,modules/**,assets/manifest.txt` — sonst fehlen die Assets im Binary. Ein natives Binary kann Classpath-Ressourcen **nicht `Files.walk`en** und **nicht direkt exec**en → `AssetExtractor` iteriert das build-generierte `assets/manifest.txt` und kopiert jede Ressource (idempotent, content-hash, 0700) in ein beschreibbares Verzeichnis, **bevor** ProcessBuilder ansible/git/docker aufruft. |
-| **Closed-World** | Kein `Class.forName`, kein Runtime-Scanning. CDI-Beans, Command-Baum, `@All List<CapabilityProvider>`, `@All List<BootstrapTask>` werden zur Build-Zeit aufgelöst. |
-| **Build- vs Runtime-Init** | `$SOT_HOME`/Env zur **Laufzeit** lesen (`SotPaths @ApplicationScoped`); `YAMLMapper` build-time via `@Produces`; Version/Commit als generierte `BuildInfo`-Ressource (kein Runtime-`git`); `SecureRandom` `--initialize-at-run-time`. |
-| **Charsets** | `quarkus.native.add-all-charsets=true` + UTF-8 `file.encoding` (deutsche Ausgabe, Non-ASCII-Vault) — im Native-Smoke-Test prüfen. |
-| **Prozess-Exec + Linking ⚠️** | `ProcessBuilder` nutzt `posix_spawn`. **ABER: voll-statische (musl) native Images können nicht fork/exec** — und das ganze Tool ruft externe Prozesse auf. Linux daher **mostly-static (glibc) oder dynamisch**, **nicht** `--static --libc=musl`. CI muss echten Subprozess-Aufruf aus dem gebauten Binary beweisen. |
-| **TLS (Self-Update)** | JDK-`HttpClient` über TLS braucht `quarkus.ssl.native=true` + eingebetteten CA-Truststore (mit Override). SHA-256 via `MessageDigest` ist Default. |
+| **Closed-World-Dynamik (Kernmuster)** | Strategie-/Resolver-**Menge** einkompiliert via `@All List<InstallStrategy>`/`@All List<VersionResolver>` → `Map<enum,bean>` zur Build-Zeit; **welche Apps** existieren = reine Laufzeit-Daten (git/http-Manifeste). Kein `Class.forName`, kein Runtime-Classloading. |
+| **Reflection** | `@RegisterForReflection` zentral in `ReflectionConfig` für **alle** Jackson-Records: `AppManifest`, `SourceSpec`, `VersionSpec`, `Requires`, `InstallSpec`, `RunnerSpec`, `CatalogIndex`, `InstalledApp`, **jede Strategie-Option-Slice**, GitHub-/Docker-Registry-DTOs, Report-Records, `AppNameCandidates`, Picocli-Provider. Sonst binden sie **null**. |
+| **Polymorphie** | `SourceSpec` generisch (`AppSourceType` + roher `JsonNode`), per-Strategie-Binding in `resolve()` — **kein** Jackson `@JsonSubTypes` (bläht die Reflection-Fläche). |
+| **Ressourcen** | Gebündelte Apps unter `src/main/resources/apps/**/app.yml`; `resources.includes` + `AssetExtractor` iteriert das **build-generierte** `assets/manifest.txt` (native kann Classpath nicht `Files.walk`en). |
+| **TLS** | `quarkus.ssl.native=true` + eingebetteter CA-Truststore (api.github.com, ghcr.io, registry-1.docker.io, Debian-Mirror) — geteilt mit Self-Update. |
+| **Prozess-Exec + Linking ⚠️** | **musl-static kann nicht fork/exec** — und jede Install/Update/Version-Prüfung ruft externe Tools. Daher **mostly-static glibc** (`-H:+StaticExecutableWithDynamicLibC`). CI muss echten Subprozess-Aufruf aus dem Binary beweisen. |
+| **Kein Daemon** | Scheduling via externe systemd/cron-Unit (von bootstrap materialisiert); Binary läuft je Tick einmal. |
+| **Kein JLine/ncurses** | Selektor = ANSI-Writes + Zeilen-Reads; `System.console()==null` → verweigern. `Clock` injizieren (deterministisch). |
 
 ---
 
-## 7. Offene Entscheidungen (vor bzw. in Phase 0 zu fixieren)
+## 8. Offene Entscheidungen
 
-Der Multi-Agenten-Entwurf hat echte Widersprüche zwischen den Schichten aufgedeckt. Empfehlung je Zeile; die mit ⚠️ sind **load-bearing**.
+Der Multi-Agenten-Entwurf hat Widersprüche zwischen Schichten aufgedeckt; hier **aufgelöst** (⚠️ = load-bearing, bitte bestätigen).
 
-| # | Entscheidung | Empfehlung | Anmerkung |
-|---|---|---|---|
-| **D1** ⚠️ | **Native-Linking:** static-musl vs mostly-static-glibc | **mostly-static glibc / dynamisch** | **Keine echte Wahl, sondern Korrektheits-Constraint:** static-musl kann nicht fork/exec → Tool wäre kaputt. Zwei Schicht-Entwürfe hatten fälschlich musl-static gewählt. |
-| **D2** | **Root-Package / groupId** | `de.jklein.sot` (= groupId) | Agenten schlugen 5 verschiedene vor; auf einen normiert. |
-| **D3** | **Install-Root + Symlink** | Root `/opt/sot`, Symlink `/usr/local/bin/sot`; `SotPaths` & `InstallLayout` zu **einem** Pfadmodell mergen | Löst R4; bestätige die Pfadwahl. |
-| **D4** | **Vokabular „Capability" vs „Extension"** | **Extension** durchgängig (User-Term = `sot extensions`/`ex`); interne Klassen konsistent benennen | Aktuell mischt der Entwurf `Capability*`-Klassen mit `extension/`-Package. |
-| **D5** | **`ProcessRunner`** Interface vs konkret | **Interface + `ProcessRunnerImpl`** | Tests brauchen das Interface (`@InjectMock`/`@Alternative`). |
-| **D6** | **Geteilte Beans deduplizieren** | je **ein** `YAMLMapper`, **ein** `Secret`-Typ, **ein** `SecretMaterializer`, **ein** `AssetExtractor`, **ein** `ProcessRunner` | Mehrere Schichten beanspruchten dieselbe „single source" — genau einmal implementieren. |
-| **D7** | **macOS-Scope** | **v1: Linux nativ (primär); macOS nur JVM/Dev.** Natives macOS-Binary + Vault-tmpfs-Strategie später | macOS hat kein `/dev/shm`; native Static-Linking ist ohnehin Linux. **Bitte bestätigen.** |
-| **D8** | **Self-Update** | Beide: `install.sh` (Erstinstallation) + `sot self-update` (Upgrade), **beide** verifizieren Checksum **+ cosign** | Angleichen (eine Schicht hatte nur `shasum`). |
-| **D9** | **Legacy-Config-Migration** | Einmal-Migrations-Reader (`FAIL_ON_UNKNOWN=false` + Key-Mapping) → schreibt kanonisches Schema, dann strikt | Nur nötig, falls **produktive SOT-Installationen im Feld** existieren — **bitte bestätigen** (sonst Greenfield). |
-| **D10** | **`module.yml` `apiVersion`** | Von Anfang an mitführen (warn-not-fail-Fenster) | Deckt zugleich D9-Manifest-Evolution ab. |
+| # | Entscheidung | Festlegung |
+|---|---|---|
+| **D1** ⚠️ | Native-Linking | **mostly-static glibc** — Korrektheits-Constraint (fork/exec); CI beweist Subprozess-Exec vor Release |
+| **D2** | Root-Package | `de.jklein.sot` |
+| **D3** ⚠️ | Install-Root + Symlink | Root **`/opt/sot`**, Symlink `/usr/local/bin/sot`; `SotPaths`/`InstallLayout` zu **einem** Modell mergen — **bitte bestätigen** |
+| **D4** | Extension/Plugin-Schicht | **Kollabiert in den App-Manager** — Extension = App mit `runner:`; alte Namen nur als Aliase |
+| **D5** | „latest version" — zwei Designs | **`InstallStrategy` (install/update/remove) delegiert an `VersionResolver` (latest)** — orthogonale Achsen (`source.type` ≠ `version.strategy`), kein Doppel-Design |
+| **D6** | Strategie-Vokabular | `AppSourceType{GIT_REPO,DOCKER_COMPOSE,GITHUB_RELEASE_BINARY,APT_DEB,SCRIPT}` (install) ⟂ `UpdateStrategy{GITHUB_RELEASE,GIT_TAG,DOCKER_IMAGE,APT,STATIC,SCRIPT}` (version) |
+| **D7** | `AppService`-Kontrakt | **Ein** Interface (Domänen-Form + Read-Views `catalog()/installed()/outdated()`) |
+| **D8** | Katalog-Refresh-Name | Kanonisch `sot app catalog refresh` (`sot app refresh`/`sync` als Alias) |
+| **D9** | Semver | Hand-gerollt native-sicher (`Version`/`VersionConstraint`); `org.semver4j` als Fallback |
+| **D10** | Scheduling | systemd-Timer (Cron-Fallback) → `sot app check --quiet --notify`; kein In-Process-Daemon |
+| **D11** ⚠️ | **Katalog-Trust (Supply-Chain)** | `CatalogSource.trust` (gepinnter git-ref / cosign+sha256 für http-index); **`script`-Strategie erfordert interaktive Bestätigung**, außer signiert+trusted; dein eigener Katalog ist die einzige Default-Trusted-Quelle — **bitte bestätigen** |
+| **D12** | Rate-Limits/Auth | ETag-Conditional-GETs + TTL-Cache + Serve-Stale; optionaler PAT; Docker-Bearer-Flow |
+| **D13** | Selektor-UI | Zeilenorientiert (kein JLine) |
+| **D14** | Build-DSL | Groovy (Quarkus-Default) |
+| **D15** | JReleaser | Gradle-Plugin (`jreleaserFullRelease`) |
+| **D16** | `install.sh` apt-installs? | **Nein** — nur das `sot`-Binary; Tools via `doctor`/`bootstrap` |
+| **D17** | Version-Pin im Ein-Zeiler | Default `releases/latest`; `SOT_VERSION`/Positional pinnt |
+| **D18** | cosign | Keyless (Fulcio/Rekor, GitHub-OIDC); sha256 Pflicht, cosign best-effort |
+| **D19** ⚠️ | macOS-Scope | v1 **Linux nativ** (amd64/arm64); macOS nur JVM/Dev — **bitte bestätigen** |
+| **D20** | Legacy-Migration | Einmal-Reader (`FAIL_ON_UNKNOWN=false` + Key-Mapping); `module.yml`→`app.yml` (Docker-Templates in je eigene compose-Apps) — nötig nur bei **Feld-Installationen** — **bitte bestätigen** |
 
 ---
 
-## 8. Migrations-Phasen (Greenfield-Neubau, „Strangler" bis Parität)
+## 9. Migrations-Phasen (Greenfield, „Strangler" bis Parität)
 
-Neubau in einem neuen Maven-Modul, **Fähigkeit für Fähigkeit**, jede Phase eine reviewbare PR mit **Abnahme-Gate**. Der alte Bash-Baum bleibt bis Phase 8 (Cutover) lauffähig als Referenz. Aufwand: **S** ≤ 2 Tage, **M** ≈ 3–5 Tage, **L** ≈ 1–2 Wochen (eine Person).
+Neubau in einem Gradle-Modul, Fähigkeit für Fähigkeit, jede Phase eine PR mit **Abnahme-Gate**. Aufwand: **S** ≤ 2 T, **M** ≈ 3–5 T, **L** ≈ 1–2 Wo.
 
-### Phase 0 — Projekt-Skelett & Foundation *(L · blockiert alles · fixiert D1–D6)*
-Maven/Quarkus/Java-21-Setup; Package-Baum; `quarkus-picocli`-Hello-World `sot version`; `YamlMapperProducer`, `SotPaths`, `AssetExtractor`, `ReflectionConfig`, `application.properties` (resources.includes, add-all-charsets, Mandrel-Image); dünnes `install.sh`-Stub; `ci.yml` mit **JVM-Verify + einem linux-amd64-Native-Smoke** (`sot version` als Native-Binary). **Linking-Entscheidung D1 hier verifizieren** (Native-Binary ruft `git --version` erfolgreich auf).
-**Gate:** `sot version` läuft als natives Binary in CI; Native-Binary kann einen externen Prozess starten (beweist mostly-static-glibc).
-
-### Phase 1 — Config-Kern *(L · hängt an 0 · löst R1/D)*
-`SotConfig`-Records (verschachtelt), `YamlConfigCodec`, `ConfigMerger`, `PlaceholderResolver` + `GeneratedValue`, `ConfigValidator`, `SecretStore` (0600-Referenz statt Secret-Feld). `default_config.yml` als einzige kanonische Vorlage.
-**Gate:** `ConfigRoundtripTest` (`load(save(cfg))==cfg`, Golden-File, jqwik-Properties inkl. `#`/Quote/CRLF); Native-IT lädt `default_config.yml` und bindet alle Sektionen.
-
-### Phase 2 — Prozess-/Exec-Engine *(M · hängt an 0 · löst R6/R3-argv)*
-`ProcessRunner`(Interface)+Impl mit Virtual-Thread-Draining, `ProcessSpec/Result`, `TeeSink`, `GitService.gitSync` (PULL/RESET_HARD, `--force`-gated), `SecretMaterializer` (0600-Datei/stdin/env, nie argv), `WorkspaceManager`, `ToolPreflight`, typisierte `runner.*Invocation`-Records.
-**Gate:** Tests mit `RecordingProcessRunner` (kein echtes ansible/git); Native-Smoke ruft echtes `git`/`echo` auf (härtet D1 endgültig ab).
-
-### Phase 3 — CLI-Gerüst & Dispatch *(L · hängt an 1+2 · löst A/F-Dispatch, R3)*
-`SotCommand`-Baum, `Main`, globale Optionen (`scope=INHERIT`), Hilfe/Version, `GenerateCompletion`, `@Command(aliases=…)` + `AliasExpander`, `InteractiveCommand`, `SotExitCode`, `ConsoleService`. Commands als dünne Schalen, die (teils gestubte) Services aufrufen.
-**Gate:** `@QuarkusMainTest` e2e über `sot help`/`--help`/`generate-completion`/Exit-Codes; Completion deckt exakt den Command-Baum.
-
-### Phase 4 — Vault & Security *(L · hängt an 1+2 · löst R5/H)*
-`Secret`(AutoCloseable), `VaultPasswordSource`(sealed)+`SecretResolver`, `TransientPasswordFile`+`PosixGuards` (tmpfs-verifiziert, fail-loud), `AnsibleVaultRunner` (Passwort via Datei/stdin), `SecretGenerator`, Qute-`secrets.yml`, `VaultService` (init/view/edit/rekey/read — view+rekey **neu funktional**), `VaultCommand`.
-**Gate:** `VaultBehaviorTest` (kein Secret in argv/`ps`, 0600-tmpfs-Datei, nach Nutzung weg); Container-IT: echter `ansible-vault` encrypt→decrypt-Roundtrip.
-
-### Phase 5 — Extensions/Capability *(L · hängt an 1+2+3 · löst R2/B)*
-`CapabilityProvider` + `LocalDirectoryProvider`/`RemoteGitProvider`, `CapabilityRegistry` (`@All`), `CapabilityService` (list/info/install/remove/enable/disable/sync/run), `ExtensionManifest`+`ManifestParser` (apiVersion), `CapabilityStateStore` (echte Persistenz), `SafeFsRemover`, `ExtensionsCommand`/`PluginsCommand`.
-**Gate:** `ExtensionManagerTest` — install/enable/sync/**persist**-Roundtrip über beide Provider; kaputtes `module.yml` schlägt bei Discovery fehl.
-
-### Phase 6 — Bootstrap, Runner & Ansible-Assets *(L · hängt an alle Services · löst C/F + Thema L)*
-`BootstrapTask`-Pipeline + `TaskRunner`/`BootstrapReport` (ehrlicher Exit), `DependencyInstaller`-Strategien, `InstallLayout`, `RunnerCommand` verdrahtet die Invocation-Records, `AssetExtractor` der eingebetteten `ansible/`. **Zusätzlich: die portierten Ansible-Assets fixen** — UFW `deny`, Rollenname `read_vault_parameter`, `/etc/hosts`-Regex, Vault-Passwort-Lifecycle, OS-Abstraktion (`package` + `when: ansible_os_family`), `ansible_facts`-Missbrauch, Docker aus Trigger lösen (**Thema L**).
-**Gate:** `sot bootstrap` bringt einen Wegwerf-Container in definierten Zustand; `ansible-lint` grün; Vault-encrypt→decrypt-Roundtrip in der Ansible-Rolle grün.
-
-### Phase 7 — Self-Update, Packaging & Release *(L · hängt an 0 + App · löst R7)*
-`GitHubReleaseClient`+`ChecksumVerifier`+`BinaryUpdater` (Sibling-Temp → verify → `ATOMIC_MOVE` → re-exec), JReleaser-Multi-Arch (linux amd64/arm64), `install.sh` vollständig (Checksum + cosign), `release.yml` (Tag `v*`), `native-build.yml`-Matrix, `.pre-commit-config` (Spotless/shellcheck-für-install.sh/yamllint/ansible-lint/gitleaks).
-**Gate:** Getaggter Release erzeugt verifizierte Per-Plattform-Binaries; `install.sh` installiert sie; `sot self-update`-Roundtrip funktioniert.
-
-### Phase 8 — Parität, Cutover & Legacy-Migration *(M · final)*
-Volle Testabdeckung (extensions/bootstrap/config/doctor/maintenance); Legacy-`config.yaml`-Migrations-Reader (D9); **die 88-Befund-Regressions-Checkliste abarbeiten** (jedes [S] nachweislich weg, jedes [C] nachweislich mitigiert, Thema-L-Fixes verifiziert); alten Bash-Baum entfernen; README/Docs neu schreiben.
-**Gate:** Paritäts-Checkliste 100 %; Bash entfernt; `refactoring-findings.md` vollständig abgehakt.
+- **Phase 0 — Skelett & Foundation** *(L · fixiert D1–D4)* — Gradle/Quarkus/Java-21, `Justfile`, `quarkus-picocli`-`sot version`, `YamlMapperProducer`/`SotPaths`/`AssetExtractor`/`ReflectionConfig`, `ci.yml` mit **JVM-Verify + linux-amd64-Native-Smoke, der einen echten Subprozess startet** (verifiziert D1). **Gate:** `sot version` nativ + Native-Binary ruft `git --version`.
+- **Phase 1 — Config-Kern** *(L · löst R1/D)* — `SotConfig`-Records, `YamlConfigCodec`, Merge/Placeholder/Validator, `SecretStore`, `CatalogSource`-Liste in der Config. **Gate:** Config-Roundtrip + native-IT bindet `default_config.yml`.
+- **Phase 2 — Prozess-/Exec-Engine** *(M · löst R6)* — `ProcessRunner`+Impl, `GitService`, `GitHubReleaseClient`, `ChecksumVerifier`, `SecretMaterializer`, `WorkspaceManager`, `ToolPreflight`. **Gate:** Native-Smoke ruft echtes `git`.
+- **Phase 3 — CLI-Gerüst** *(M · löst A/F-Dispatch)* — `SotCommand`-Baum, `Main`, Hilfe/Version/Completion, Aliase, Exit-Codes, `ConsoleService`. **Gate:** `@QuarkusMainTest` e2e.
+- **Phase 4 — ★ App-Manager Kern** *(L · Anforderung B, löst R2/B)* — `AppManifest`+`ManifestParser`, `AppCatalog` (git/http/bundled), 5 `InstallStrategy`-Beans, `AppService`, `InstalledAppStore`, `SafeFsRemover`, `requires`-Topo-Sort. **Gate:** install/update/remove/**persist** je Strategie über einen Test-Katalog; kaputtes Manifest failt bei Discovery.
+- **Phase 5 — ★ Update-Überwachung** *(L · Anforderung B)* — `VersionResolver`-SPI (5), `UpdateMonitorService` (Virtual-Thread-Fan-out), `VersionCache` (ETag/TTL/Serve-Stale), `SemVer`/`VersionConstraint`, Pins, `UpdateScheduler`/`UpdateNotifier`. **Gate:** `outdated` über Mock-Resolver korrekt (up-to-date/outdated/pinned/unknown); Cache-Roundtrip.
+- **Phase 6 — ★ App-Selektor & Command-Surface** *(M · Anforderung B)* — `AppCommand`-Baum, `AppSelector` (zeilenorientiert), Renderer, alle Subcommands, `--json`/`--yes`, `AppNameCandidates`-Completion, `ex`/deprecated Forwarder. **Gate:** `@QuarkusMainTest` über list/install/outdated/selector; non-TTY→list.
+- **Phase 7 — Vault, Bootstrap, Runner & Ansible-Assets** *(L · löst R5/C/F + Thema L)* — `VaultService`+`Secret`+tmpfs, `BootstrapTask`-Pipeline, `DependencyInstaller`, `RunnerCommand`, systemd-Timer-Materialisierung; **Ansible-Assets fixen** (UFW `deny`, Rollenname, hosts-Regex, Vault-Lifecycle, OS-Abstraktion). **Gate:** `sot bootstrap` gegen Wegwerf-Container; `ansible-lint`; Vault-Roundtrip.
+- **Phase 8 — Install-Einzeiler, Packaging & Release** *(L · Anforderung A, löst R7)* — `install.sh` (uname/download/verify/PATH), `SelfUpdateCommand`+`BinaryUpdater`, JReleaser-Gradle-Multi-Arch, `native-build.yml`/`release.yml`, `.pre-commit`. **Gate:** Getaggter Release → verifizierte Binaries; **der Ein-Zeiler installiert `sot` in einem frischen Debian-Container**; `sot self-update`-Roundtrip.
+- **Phase 9 — Parität, Cutover & Legacy-Migration** *(M · final)* — volle Coverage, Legacy-`config.yaml`/`module.yml`→`app.yml`-Migrations-Reader, **88-Befund-Regressions-Checkliste** (jedes [S] weg, [C] mitigiert, [L] gefixt), Bash entfernen, README neu. **Gate:** Checkliste 100 %; `mvn`/`pom.xml`/`--libc=musl`-grep leer.
 
 ### Sequenz
-
 ```
-Phase 0 (Skelett/Foundation, fixiert D1–D6)
-   └─► Phase 1 (Config) ─┐
-   └─► Phase 2 (Exec) ───┤
-                         ├─► Phase 3 (CLI) ─► Phase 5 (Extensions)
-                         ├─► Phase 4 (Vault)          │
-                         └─► Phase 6 (Bootstrap+Runner+Ansible-Assets)
-Phase 7 (Release/Self-Update)  ── ab Phase 0 vorbereitbar, voll ab lauffähiger App
-Phase 8 (Parität/Cutover/Migration)  ── ganz zuletzt
+0 (Skelett, D1) → 1 (Config) & 2 (Exec)
+                     └→ 3 (CLI) → 4 (App-Kern) → 5 (Update-Monitor) → 6 (Selektor)
+                     └→ 7 (Vault/Bootstrap/Ansible)   [parallel ab 2]
+8 (Install/Release)  [ab 0 vorbereitbar, voll ab lauffähiger App]
+9 (Parität/Cutover)  [zuletzt]
 ```
-**Kritischer Pfad:** 0 → 1/2 → 3 → 5/6 → 8. Phase 4 parallel ab 2; Phase 7 parallel ab 0.
+**Kritischer Pfad:** 0 → 1/2 → 3 → 4 → 5 → 6 → 8 → 9. Der App-Manager (4–6) ist der Wertkern und der größte Brocken.
 
 ---
 
-## 9. Verifikationsstrategie
+## 10. Verifikationsstrategie
 
-- **Drei Test-Tiers:** (1) `@QuarkusTest` JVM-Komponententests mit gemocktem `ProcessRunner` (nie echtes ansible/git); (2) `@QuarkusMainTest` CLI-e2e über `QuarkusMainLauncher`; (3) `@QuarkusMainIntegrationTest` **native** Black-Box-Smoke mit `FakeToolPathResource` (echte Fake-Tools auf PATH).
-- **Native-Gate ist Pflicht:** Ein natives IT lädt Config, parst jedes echte `module.yml`, fährt einen Runner-Dry-Run — verwandelt Reflection-/Ressourcen-Fehler von Runtime-Überraschungen in gefangene CI-Fehler.
-- **Paritäts-Checkliste** gegen `refactoring-findings.md`: jeder der 88 Befunde bekommt einen Status (dissolved-[S] / hardened-[C] / ansible-fixed-L) mit Test- oder Code-Nachweis. Das ist das Abnahmekriterium für Phase 8.
-- **Verhaltens- statt Text-Tests** für Security (kein Secret in argv via `ps`; 0600-tmpfs).
-- **CI failt hart** (kein `|| true`); SonarCloud-Quality-Gate als Required-Check.
+- **Drei Test-Tiers:** `@QuarkusTest` (JVM, gemockter `ProcessRunner`/`VersionResolver`) · `@QuarkusMainTest` (CLI-e2e) · `@QuarkusMainIntegrationTest` (**native** Black-Box, `FakeToolPathResource`).
+- **Native-Gate Pflicht:** ein natives IT lädt Config, parst je ein Manifest **jedes** `source.type`, startet einen echten Subprozess (`git --version`) — verwandelt Reflection-/Linking-Fehler in gefangene CI-Fehler.
+- **Release-Smoke:** der publizierte Ein-Zeiler wird in einem **frischen Debian-Container** gegen den echten Release ausgeführt (Anforderung A).
+- **Paritäts-Checkliste** gegen `refactoring-findings.md`: jeder der 88 Befunde bekommt Status [S]/[C]/[L] mit Nachweis — Abnahme für Phase 9.
+- **Supply-Chain-Test:** ein unsigniertes Katalog-Manifest mit `script`-Strategie muss ohne Bestätigung **abgelehnt** werden.
+- **CI failt hart** (kein `|| true`).
 
 ---
 
-## 10. Risiken & Gegenmaßnahmen (Top 8)
+## 11. Risiken & Gegenmaßnahmen (Top 8)
 
 | # | Risiko | Gegenmaßnahme |
 |---|---|---|
-| 1 ⚠️ | **static-musl kann nicht fork/exec** (architektur-brechend) | **mostly-static glibc/dynamisch** bauen; libc im Asset-Namen; CI beweist Subprozess-Exec aus dem Binary vor jedem Release (D1) |
-| 2 | Native Reflection/Ressourcen-Miss zeigt sich erst zur Laufzeit | Zentrale `ReflectionConfig`; Pflicht-Native-IT (Config-Load + alle `module.yml` + Runner-Dry-Run); Build-Assert, dass jeder `resources.includes`-Glob + `manifest.txt`-Eintrag auflöst |
-| 3 | Secret-Restexposition (Heap-Copy, unsicheres Secure-Delete) | tmpfs(RAM)+0600+sofort-unlink+SecureRandom-Name+`O_EXCL`/`NOFOLLOW` (killt Symlink-Race 165); Overwrite = Best-Effort; try-with-resources; Core-Dumps aus; Restrisiko dokumentiert |
-| 4 | tmpfs fehlt/ist Disk (Container, macOS) → Passwort auf Platte | `PosixGuards` verifiziert echtes tmpfs und **failt laut** statt still zu persistieren; gatet zugleich macOS (D7) |
-| 5 | Legacy-`config.yaml` bricht striktes Binding | Einmal-Migrations-Reader (`FAIL_ON_UNKNOWN=false` + Key-Mapping) → kanonisch umschreiben, dann strikt (D9) |
-| 6 | Destruktiver `RESET_HARD`-Datenverlust (aus `update.sh`) | `SyncMode.RESET_HARD` nur mit `--force`; Default `PULL`; eine auditierte `GitService`-Methode |
-| 7 | Self-Replace scheitert Cross-Device/EACCES; TLS/CA bricht Download | Temp ins Zielverzeichnis, Checksum+cosign vor `ATOMIC_MOVE`, klare Fallback-Meldung bei EXDEV/EACCES; CA eingebettet + Override |
-| 8 | Lange/flaky Multi-Arch-Native-Builds, Mandrel-Drift | PRs: JVM-Verify + 1× linux-amd64-Smoke; volle Matrix nur auf Tag (`fail-fast:false`); Mandrel-Version + Builder-Image-Tag pinnen; Renovate-Bumps müssen das Native-Gate bestehen |
-
----
-
-## 11. Abhängigkeiten (Kurzliste)
-
-**Runtime:** `quarkus-picocli`, `quarkus-arc`, `quarkus-jackson`, `jackson-dataformat-yaml` (SnakeYAML), `quarkus-hibernate-validator`, `quarkus-qute`.
-**Test:** `quarkus-junit5`, `quarkus-junit5-mockito`, `quarkus-jacoco`, `assertj-core`, `jqwik`.
-**Build/Release:** `quarkus-maven-plugin`, `jreleaser-maven-plugin`, `spotless-maven-plugin`, `jacoco-maven-plugin`, `sonar-maven-plugin`; Actions: `graalvm/setup-graalvm@v1` (Mandrel 21, gepinnt), `anchore/sbom-action` (Syft), `sigstore/cosign`.
+| 1 ⚠️ | **musl-static kann nicht fork/exec** | mostly-static glibc; CI beweist Subprozess-Exec vor Release (D1) |
+| 2 ⚠️ | **Supply-Chain / RCE** — Katalog-Manifest mit `script`/deb-Strategie führt Fremdcode aus; `curl\|bash` ist MITM-Fläche | Kataloge signieren/pinnen (git-ref bzw. cosign+sha256); `script` nur mit Bestätigung außer trusted; `install.sh` sha256 **Pflicht** + cosign keyless, nur https (D11/D18) |
+| 3 | Native-Reflection-Miss → stilles null-Binden → Fehl-Installation | zentrale `ReflectionConfig`; native-IT bindet je `source.type` ein Manifest voll |
+| 4 | `outdated`-Fan-out langsam / rate-limited (60 GitHub-Calls/h unauth) | Virtual-Threads + ETag-Conditional-GETs (304 gratis) + TTL-Cache + Serve-Stale + optionaler PAT + denormalisierte Version im Index |
+| 5 | Versions-Heterogenität (calver/sha/`:latest`) → falsche Ordnung | Gleichheit/Digest statt erfundener Ordnung; optionaler `tagPattern`; sonst `UNKNOWN` |
+| 6 | Selektor blockiert nicht-interaktiv (CI, Pipe) | `System.console()==null`→`list`; jede mutierende Verb-Form hat `--yes` |
+| 7 | `install.sh`-Asset-Namen driften von JReleaser | Schema `sot-<os>-<arch>` single-sourcen; Release-Smoke im Container |
+| 8 | Destruktiver `RESET_HARD` / `rm -rf` | `--force`-Gate; `SafeFsRemover`-Denylist; eine auditierte `GitService`-Methode |
 
 ---
 
 ## 12. Aufwand (Größenordnung)
 
-Grobe Hausnummer für **eine erfahrene Person**: Phasen 0–8 summieren sich auf **~10–14 Wochen** (Skelett+Config+Exec+CLI je ~1–2 Wochen; Vault/Extensions/Bootstrap je ~1–2 Wochen inkl. Ansible-Asset-Fixes; Release ~1 Woche; Parität/Cutover ~1 Woche). Mit 2–3 Personen ab Phase 1 parallelisierbar (Config/Exec/Vault unabhängig) auf **~6–8 Wochen**. Das native-image-Gate früh (Phase 0) zu etablieren ist der wichtigste Risiko-Hebel.
+Für **eine erfahrene Person** grob **~12–16 Wochen** (Skelett/Config/Exec/CLI je ~1–2 Wo; **App-Kern + Update-Monitor + Selektor je ~1.5–2 Wo — der Wertkern**; Vault/Bootstrap/Ansible ~1.5 Wo; Install/Release ~1 Wo; Parität/Cutover ~1 Wo). Mit 2–3 Personen ab Phase 1 parallelisierbar (Config/Exec/Vault unabhängig; App-Kern → Update → Selektor seriell) auf **~7–9 Wochen**. Wichtigster Risiko-Hebel: das native-image-Gate **und** einen End-to-End-Dünnschnitt (`sot version` nativ → Install-Einzeiler) **früh** (Phase 0/8-Vorzug) etablieren.
