@@ -1,4 +1,8 @@
-# SOT — Refactoring-Plan
+# SOT — Refactoring-Plan (Bash-in-place)
+
+> ⚠️ **SUPERSEDED / historisch.** Die Richtung wurde geändert: SOT wird **nicht** in Bash refactored, sondern **komplett auf ein natives Java-CLI (Quarkus + GraalVM) neugebaut** — siehe **[`java-quarkus-rewrite-plan.md`](./java-quarkus-rewrite-plan.md)**.
+>
+> Dieses Dokument bleibt als **Kontext** erhalten: Es dokumentiert Zweck, Ist-Diagnose und die 3 Grundursachen. Die dort beschriebenen 8 Bash-Phasen sind **obsolet**; die **Befund-/Capability-Inventur** ([`refactoring-findings.md`](./refactoring-findings.md)) bleibt hingegen die **funktionale Spezifikation + Regressions-Checkliste** für den Java-Neubau (jede heute vorhandene Fähigkeit muss im Java-CLI erhalten bleiben; jeder der 88 Bugs muss im Neubau strukturell verschwinden).
 
 > Erstellt aus einer tiefgehenden Analyse des gesamten Repos (10 Subsystem-Kartierungen + 5 Querschnitts-Audits, 88 deduplizierte Befunde: **27 High / 36 Medium / 25 Low**). Dieser Plan beschreibt **Zweck → Ist-Zustand → Ziel-Architektur → phasenweisen Umbau**. Er ist die Grundlage für die Umsetzung; es wurde noch **kein Produktivcode geändert**.
 >
