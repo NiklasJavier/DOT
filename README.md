@@ -23,6 +23,18 @@
 
 ---
 
+---
+
+## Agents & contributor DX
+
+| | |
+|--|--|
+| **Agents** | Full doctrine + planner: [`erynoa.md`](./erynoa.md) |
+| **Docs map** | [`docs/README.md`](./docs/README.md) |
+| **Dev shell** | `nix develop` then `just doctor` · `just test` |
+
+> End-user server install remains the curl bootstrap below. **Contributors/agents** use Nix + just.
+
 ## 📋 Übersicht
 
 Das **Server Operation Toolkit (SOT)** bietet ein konsistentes CLI für Server-Operationen,
