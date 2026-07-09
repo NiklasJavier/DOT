@@ -66,3 +66,14 @@ check:
 install:
     @echo "Contributor tools: nix develop (flake.nix)"
     @echo "Host bootstrap (ops): see README curl installer — separate from dev DX"
+
+# hard Erynoa gate (exit 1 on fail) — requires Agent Surface SSOT on machine
+gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT="${AGENT_SURFACE_ROOT:-${AI_HARNESS_ROOT:-$HOME/Dev/30_projects/31_own/ai-harness}}"
+    if [[ -x "$ROOT/bin/erynoa-gate" ]]; then
+      "$ROOT/bin/erynoa-gate" --ci .
+    else
+      python3 "$ROOT/skills/erynoa-md/scripts/erynoa-gate.py" --ci .
+    fi
