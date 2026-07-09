@@ -525,3 +525,27 @@ MIT License — siehe [LICENSE](LICENSE)
 **[⬆ Nach oben](#sot--server-operation-toolkit)**
 
 </div>
+
+<!-- ERYNOA-MODEL:BEGIN -->
+## Model
+
+> System sketch (**SE-04**). Depth: [`docs/README.md`](./docs/README.md) · agents: [`erynoa.md`](./erynoa.md).
+
+```mermaid
+flowchart LR
+  Op[Operator] --> CLI[bin/sot]
+  CLI --> Cmd[commands/]
+  Cmd --> Lib[lib/]
+  Cmd --> Mod[modules/]
+  CLI --> Cfg[config/]
+  Boot[bootstrap/] -.-> Op
+```
+
+| Part | Role |
+|------|------|
+| `bin/sot` | CLI entry |
+| `commands/` · `lib/` | Verbs + shared bash |
+| `modules/` | Ansible / Docker / SDKMAN packs |
+| `config/` | Defaults + overrides |
+
+<!-- ERYNOA-MODEL:END -->
